@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
+from piecewise_cuda_graphs import is_in_piecewise_graph, no_graph
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
@@ -98,6 +99,14 @@ class RadixLinearAttention(nn.Module):
                     output,
                     self.layer_id,
                 )
+            elif is_in_piecewise_graph():
+                spcg_unified_linear_attention_with_output(
+                    mixed_qkv,
+                    a,
+                    b,
+                    output,
+                    self.layer_id,
+                )
             else:
                 unified_linear_attention_with_output(
                     mixed_qkv,
@@ -154,5 +163,10 @@ def unified_linear_attention_with_output(
 
 
 bcg_unified_linear_attention_with_output = eager_on_graph(True)(
+    unified_linear_attention_with_output
+)
+
+# Standalone piecewise CUDA graph variant (used when the standalone runner is selected).
+spcg_unified_linear_attention_with_output = no_graph(
     unified_linear_attention_with_output
 )

@@ -19,6 +19,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from piecewise_cuda_graphs import is_in_piecewise_graph, no_graph
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
@@ -130,6 +131,10 @@ class RadixAttention(nn.Module):
                 bcg_unified_attention_with_output(
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs
                 )
+            elif is_in_piecewise_graph():
+                spcg_unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
             else:
                 unified_attention_with_output(
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs
@@ -222,3 +227,6 @@ def unified_attention_with_output(
 
 
 bcg_unified_attention_with_output = eager_on_graph(True)(unified_attention_with_output)
+
+# Standalone piecewise CUDA graph variant (used when the standalone runner is selected).
+spcg_unified_attention_with_output = no_graph(unified_attention_with_output)

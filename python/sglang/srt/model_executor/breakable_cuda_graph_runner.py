@@ -80,6 +80,15 @@ class BreakableCudaGraphRunner:
     graph capture of the eager kernel stream.
     """
 
+    # Capture backend for this (breakable) runner. The capture/replay flow is
+    # identical across runners; subclasses specialize the backend by overriding
+    # the ``_make_graph`` / ``_make_capture_context`` helpers (e.g. the standalone
+    # piecewise runner delegates both to the ``piecewise_cuda_graphs`` package).
+    _graph_cls = BreakableCUDAGraph
+    _capture_cls = BreakableCUDAGraphCapture
+    _enable_graph_ctx = staticmethod(enable_breakable_cuda_graph)
+    _log_prefix = "[BCG]"
+
     def __init__(self, model_runner: ModelRunner):
         self.model_runner = model_runner
         self.device = model_runner.device
@@ -115,7 +124,7 @@ class BreakableCudaGraphRunner:
 
         log_info_on_rank0(
             logger,
-            f"[BCG] Capture num tokens: {self.capture_num_tokens}",
+            f"{self._log_prefix} Capture num tokens: {self.capture_num_tokens}",
         )
 
         self._init_buffers(model_runner)
@@ -138,8 +147,9 @@ class BreakableCudaGraphRunner:
             # If we can't find the inner layer_model, disable BCG.
             self.layer_model = None
             logger.warning(
-                "[BCG] Could not resolve inner layer_model on %s. BCG is "
-                "disabled for this model; prefill will fall back to eager.",
+                "%s Could not resolve inner layer_model on %s. Disabled "
+                "for this model; prefill will fall back to eager.",
+                self._log_prefix,
                 type(language_model).__name__,
             )
             return
@@ -338,7 +348,7 @@ class BreakableCudaGraphRunner:
         with (
             freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
             graph_capture() as graph_capture_context,
-            enable_breakable_cuda_graph(),
+            self._enable_graph_ctx(),
         ):
             stream = graph_capture_context.stream
             pool = get_global_graph_memory_pool()
@@ -356,7 +366,7 @@ class BreakableCudaGraphRunner:
                         empty_cache=False,
                     )
                     capture_range.set_description(
-                        f"[BCG] Capturing ({num_tokens=} {avail_mem=:.2f} GB)"
+                        f"{self._log_prefix} Capturing ({num_tokens=} {avail_mem=:.2f} GB)"
                     )
 
                 graph, output = self._capture_one(num_tokens, pool, stream)
@@ -403,11 +413,24 @@ class BreakableCudaGraphRunner:
                 self.model_runner.tp_group.barrier()
                 run_once()
 
-            graph = BreakableCUDAGraph()
-            with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
+            graph = self._make_graph(pool)
+            with self._make_capture_context(graph, pool, stream):
                 output = run_once()
 
         return graph, output
+
+    def _make_graph(self, pool):
+        """Build the empty graph container for one capture. Overridable by
+        subclasses whose graph type takes the memory pool at construction time
+        (e.g. the standalone piecewise runner's ``CUDAGraphSequence``); the
+        breakable graph instead takes the pool per segment at capture time."""
+        return self._graph_cls()
+
+    def _make_capture_context(self, graph, pool, stream):
+        """Build the capture context manager for one graph. Overridable by
+        subclasses that use a different capture backend (e.g. the standalone
+        piecewise runner, which delegates to ``piecewise_cuda_graphs``)."""
+        return self._capture_cls(cuda_graph=graph, pool=pool, stream=stream)
 
     def replay_prepare(self, forward_batch, **kwargs):
         # TODO: fix PiecewiseCudaGraphRunner to support draft workers as well.
@@ -457,7 +480,7 @@ class BreakableCudaGraphRunner:
             captured_graph.replay()
             return captured_hidden
 
-        with enable_breakable_cuda_graph():
+        with self._enable_graph_ctx():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
             original_layer_forward = self.layer_model.forward

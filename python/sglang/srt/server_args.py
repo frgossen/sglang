@@ -715,6 +715,7 @@ class ServerArgs:
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_breakable_cuda_graph: bool = False
+    enable_standalone_piecewise_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
@@ -6295,6 +6296,12 @@ class ServerArgs:
             "--enable-breakable-cuda-graph",
             action="store_true",
             help="Use breakable CUDA graph for piecewise capture instead of torch.compile-based splitting.",
+        )
+        parser.add_argument(
+            "--enable-standalone-piecewise-cuda-graph",
+            action="store_true",
+            help="Use the standalone 'piecewise_cuda_graphs' package for piecewise "
+            "capture instead of torch.compile-based splitting.",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",
