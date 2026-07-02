@@ -1,0 +1,1 @@
+{"run_name": "moonshotai/Kimi-K2.6:no_cuda_graph", "batch_size": 16, "input_len": 512, "output_len": 8, "prefill_latency": 0.48930826608557254, "prefill_throughput": 16742.00206249396, "median_decode_latency": 0.06584712595213205, "median_decode_throughput": 242.9870669166532, "total_latency": 0.9507995849708095, "overall_throughput": 8750.529692601236}

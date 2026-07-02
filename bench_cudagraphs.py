@@ -14,25 +14,37 @@ Variants:
 """
 
 import json
+import os
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-MODELS = [
-    "openai/gpt-oss-120b",  # works for bs=1
-    # "deepseek-ai/DeepSeek-V3.2",  # works with from source install of sgl-deep-gemm (bs=1) -- fails again
-    "moonshotai/Kimi-K2.6", # works for bs=1
-    "zai-org/GLM-4.7", # works for bs=1
-    # "MiniMaxAI/MiniMax-M2.7", #fails
-    "Qwen/Qwen3.6-35B-A3B", # works for bs=1
-    "meta-llama/Meta-Llama-3-8B-Instruct",# works for bs=1
-    "meta-llama/Meta-Llama-3-70B-Instruct",# works for bs=1
-    "meta-llama/Llama-3.1-405B-Instruct-FP8", # works for bs=1
+# model -> variants to run (per the "works for" notes; bs=1).
+ALL_VARIANTS = [
+    "no_cuda_graph",
+    "full_cuda_graph",
+    "pcg_torch_compile",
+    "pcg_standalone",
+    "bcg",
 ]
-BATCH_SIZES = ["1"] #, "4", "16"]
+MODEL_VARIANTS = {
+    "openai/gpt-oss-120b": ALL_VARIANTS,
+    # "deepseek-ai/DeepSeek-V3.2": ["no_cuda_graph"],
+    # "moonshotai/Kimi-K2.6": ["no_cuda_graph"],
+    # "zai-org/GLM-4.7": ["no_cuda_graph"],
+    "MiniMaxAI/MiniMax-M2.7": ALL_VARIANTS,
+    "Qwen/Qwen3.6-35B-A3B": ALL_VARIANTS,
+    "meta-llama/Meta-Llama-3-8B-Instruct": ALL_VARIANTS,
+    "meta-llama/Meta-Llama-3-70B-Instruct": ALL_VARIANTS,
+    "meta-llama/Llama-3.1-405B-Instruct-FP8": ALL_VARIANTS,
+}
+
+# Common flags for all models and variants.
+BATCH_SIZES = ["1", "4", "16"]
 INPUT_LENS: list[str] = ["512"]
 OUTPUT_LENS = ["8"]
-
 COMMON_FLAGS = [
     "--batch-size",
     *BATCH_SIZES,
@@ -41,6 +53,8 @@ COMMON_FLAGS = [
     "--output-len",
     *OUTPUT_LENS,
 ]
+
+# Model-specific flags.
 MODEL_FLAGS = {
     "meta-llama/Llama-3.1-405B-Instruct-FP8": [
         "--trust-remote-code",
@@ -52,7 +66,7 @@ MODEL_FLAGS = {
     "deepseek-ai/DeepSeek-V3.2": [
         "--trust-remote-code",
         "--mem-fraction-static",
-        "0.95",
+        "0.9",
         "--tp-size",
         "8",
     ],
@@ -85,39 +99,102 @@ MODEL_FLAGS = {
         "4",
     ],
 }
-PIECEWISE_TOKENS = ["512", "2048", "8192"]  # must cover bs*input_len
-OUT = Path(__file__).resolve().parent / "bench_cudagraphs_results"
 
+# Variant-specific flags.
+PIECEWISE_TOKENS = ["512", "2048", "8192"]  # must cover bs*input_len
 VARIANT_FLAGS = {
     "no_cuda_graph": [
         "--disable-cuda-graph",
         "--disable-piecewise-cuda-graph",
     ],
-    # "full_cuda_graph": [],
-    # "pcg_torch_compile": [
-    #     "--piecewise-cuda-graph-tokens",
-    #     *PIECEWISE_TOKENS,
-    # ],
-    # "pcg_standalone": [
-    #     "--enable-standalone-piecewise-cuda-graph",
-    #     "--piecewise-cuda-graph-tokens",
-    #     *PIECEWISE_TOKENS,
-    # ],
-    # "bcg": [
-    #     "--enable-breakable-cuda-graph",
-    #     "--piecewise-cuda-graph-tokens",
-    #     *PIECEWISE_TOKENS,
-    # ],
+    "full_cuda_graph": [],
+    "pcg_torch_compile": [
+        "--piecewise-cuda-graph-tokens",
+        *PIECEWISE_TOKENS,
+    ],
+    "pcg_standalone": [
+        "--enable-standalone-piecewise-cuda-graph",
+        "--piecewise-cuda-graph-tokens",
+        *PIECEWISE_TOKENS,
+    ],
+    "bcg": [
+        "--enable-breakable-cuda-graph",
+        "--piecewise-cuda-graph-tokens",
+        *PIECEWISE_TOKENS,
+    ],
 }
+
+
+OUT = Path(__file__).resolve().parent / "bench_cudagraphs_results"
+TIMEOUT_S = 10 * 60  # per-benchmark timeout; bump if runs need longer
+RECOVER_TIMEOUT_S = 120  # max wait for our GPU procs to clear between runs
+WORKSPACE_MARKER = "workspace-sgl"  # only reap GPU procs belonging to us
+
+
+
+def _workspace_gpu_pids():
+    """GPU-holding PIDs whose process name references this workspace.
+
+    The conda env is named `workspace-sgl`, so the interpreter path that
+    nvidia-smi reports (e.g. .../envs/workspace-sgl/bin/python) carries the
+    marker. Filtering on it keeps us from killing unrelated GPU jobs.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids = []
+    for line in out.splitlines():
+        pid, _, name = line.partition(",")
+        if pid.strip().isdigit() and WORKSPACE_MARKER in name:
+            pids.append(int(pid.strip()))
+    return sorted(set(pids))
+
+
+def _recover_between_runs(proc):
+    """Leave the GPUs clean for the next variant.
+
+    bench_one_batch's TP workers can survive a crash (e.g. hung in NCCL
+    teardown after one rank OOMs) and keep ~80 GB/GPU pinned, which then OOMs
+    the next run at weight load. Kill the run's process group, then poll
+    nvidia-smi until none of this workspace's processes are left on the GPUs,
+    reaping stragglers that don't exit on their own.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+
+    deadline = time.monotonic() + RECOVER_TIMEOUT_S
+    while True:
+        pids = _workspace_gpu_pids()
+        if not pids:
+            return
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if time.monotonic() > deadline:
+            print(f"  [recover] workspace GPU procs still present: {pids}", flush=True)
+            return
+        time.sleep(2)
 
 
 def main():
     OUT.mkdir(exist_ok=True)
     failures = []
-    for model in MODELS:
+    for model, variants in MODEL_VARIANTS.items():
         model_dir = OUT / model.replace("/", "__")
         model_dir.mkdir(exist_ok=True)
-        for name, variant_flags in VARIANT_FLAGS.items():
+        for name in variants:
+            variant_flags = VARIANT_FLAGS[name]
             result_file = model_dir / f"{name}.jsonl"
             result_file.unlink(missing_ok=True)  # bench_one_batch appends
             model_flags = MODEL_FLAGS.get(model, ["--tp-size", "1"])
@@ -139,11 +216,21 @@ def main():
             # Keep going on failure so one bad variant doesn't waste the whole
             # sweep; record it and report at the end. A run can also "succeed"
             # (exit 0) without producing results, so flag a missing file too.
-            ret = subprocess.run(cmd)
-            if ret.returncode != 0:
-                failures.append((model, name, f"exit {ret.returncode}"))
-            elif not result_file.exists():
-                failures.append((model, name, "no result file written"))
+            # start_new_session puts the child in its own process group so that
+            # _recover_between_runs can kill the whole tree (bench_one_batch
+            # spawns TP workers); subprocess's own kill only reaps the direct
+            # child and would leave those workers orphaned on the GPU.
+            proc = subprocess.Popen(cmd, start_new_session=True)
+            try:
+                returncode = proc.wait(timeout=TIMEOUT_S)
+                if returncode != 0:
+                    failures.append((model, name, f"exit {returncode}"))
+                elif not result_file.exists():
+                    failures.append((model, name, "no result file written"))
+            except subprocess.TimeoutExpired:
+                failures.append((model, name, f"timeout after {TIMEOUT_S}s"))
+            finally:
+                _recover_between_runs(proc)
 
     print(f"\nResults written to {OUT}/<model>/*.jsonl")
     if failures:
@@ -154,12 +241,12 @@ def main():
 
 
 def print_summary():
-    names = list(VARIANT_FLAGS)
-    for model in MODELS:
+    for model, variants in MODEL_VARIANTS.items():
+        names = list(variants)
         model_dir = OUT / model.replace("/", "__")
         # (bs, il, ol) -> {variant: row}
         rows = {}
-        for name in VARIANT_FLAGS:
+        for name in variants:
             result_file = model_dir / f"{name}.jsonl"
             if not result_file.exists():
                 continue  # variant failed, was skipped, or not yet run -> n/a

@@ -1,0 +1,1 @@
+{"run_name": "zai-org/GLM-4.7:no_cuda_graph", "batch_size": 16, "input_len": 512, "output_len": 8, "prefill_latency": 0.48099563003052026, "prefill_throughput": 17031.33976389806, "median_decode_latency": 0.10360942792613059, "median_decode_throughput": 154.42610117881708, "total_latency": 1.2082984558073804, "overall_throughput": 6885.715991783345}

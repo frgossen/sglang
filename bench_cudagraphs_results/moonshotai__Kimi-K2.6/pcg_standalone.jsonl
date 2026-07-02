@@ -1,0 +1,1 @@
+{"run_name": "moonshotai/Kimi-K2.6:pcg_standalone", "batch_size": 1, "input_len": 512, "output_len": 8, "prefill_latency": 0.07325815199874341, "prefill_throughput": 6988.983287604392, "median_decode_latency": 0.007968988997163251, "median_decode_throughput": 125.48643251433444, "total_latency": 0.1294055349426344, "overall_throughput": 4018.3752590684508}
