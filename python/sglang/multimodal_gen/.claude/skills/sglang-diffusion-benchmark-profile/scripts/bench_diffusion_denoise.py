@@ -32,6 +32,7 @@ Input images required for image-guided models:
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -68,7 +69,7 @@ DIFFUSERS_FALLBACK_SIGNALS = (
     "loaded diffusers pipeline",
 )
 CATALOG_TABLE_WIDTH = 140
-RESULTS_TABLE_WIDTH = 105
+RESULTS_TABLE_WIDTH = 112
 NIGHTLY_PRESET_ORDER = (
     "flux",
     "flux2",
@@ -767,6 +768,7 @@ def build_sglang_cmd(
     seed: int = 42,
     save_output: bool = True,
     artifact_dir: Optional[Path] = None,
+    iterations: int = 1,
 ) -> list[str]:
     """
     Build the `sglang generate` command for the given model.
@@ -815,17 +817,60 @@ def build_sglang_cmd(
     if perf_dump_path:
         cmd.extend(["--perf-dump-path", perf_dump_path])
 
+    if iterations > 1:
+        # One prompt line per request; the CLI runs them sequentially in one process.
+        prompt_root = (
+            Path(artifact_dir)
+            if artifact_dir is not None
+            else get_output_dir("benchmarks", REPO_ROOT)
+        )
+        prompt_path = (
+            ensure_dir(prompt_root / "generated_prompts")
+            / f"{model_key}_x{iterations}.txt"
+        )
+        prompt_path.write_text("\n".join([cfg["prompt"]] * iterations) + "\n")
+        cmd = [x for x in cmd if not x.startswith("--prompt=")]
+        cmd.append(f"--prompt-file-path={prompt_path}")
+
     return cmd
 
 
-def run_benchmark_once(
+def _iteration_latencies_s(lines: list[str]) -> tuple[list[float], list[float]]:
+    """Per-request denoise and e2e seconds; the perf dump only holds request 1."""
+    ansi = re.compile(r"\x1b\[[0-9;]*m")
+    stage_re = re.compile(
+        r"\[(\w*(?:Denoising|Refinement)Stage)\] finished in ([0-9.]+) seconds"
+    )
+    e2e_re = re.compile(r"generated successfully in ([0-9.]+) seconds")
+
+    denoise: list[float] = []
+    e2e: list[float] = []
+    current = 0.0
+    for raw_line in lines:
+        line = ansi.sub("", raw_line)
+        if "Running pipeline stages:" in line and current:
+            denoise.append(current)
+            current = 0.0
+        stage_match = stage_re.search(line)
+        if stage_match and "BeforeDenoisingStage" not in stage_match.group(1):
+            current += float(stage_match.group(2))
+        e2e_match = e2e_re.search(line)
+        if e2e_match:
+            e2e.append(float(e2e_match.group(1)))
+    if current:
+        denoise.append(current)
+    return denoise, e2e
+
+
+def run_benchmark(
     model_key: str,
     label: str,
     output_dir: Path,
     warmup: bool = True,
     torch_compile: bool = True,
+    iterations: int = 1,
 ) -> dict:
-    """Run a single benchmark pass and return results dict."""
+    """Run `iterations` requests and return results dict, discarding the first."""
     perf_path = output_dir / f"{model_key}_{label}.json"
 
     cmd = build_sglang_cmd(
@@ -834,6 +879,7 @@ def run_benchmark_once(
         warmup=warmup,
         torch_compile=torch_compile,
         artifact_dir=output_dir,
+        iterations=iterations,
     )
 
     env = os.environ.copy()
@@ -882,9 +928,11 @@ def run_benchmark_once(
         bufsize=1,
     )
     fallback_detected = False
+    captured: list[str] = []
     assert process.stdout is not None
     for line in process.stdout:
         print(line, end="")
+        captured.append(line)
         if any(signal in line.lower() for signal in DIFFUSERS_FALLBACK_SIGNALS):
             fallback_detected = True
     returncode = process.wait()
@@ -960,6 +1008,17 @@ def run_benchmark_once(
         except Exception as e:
             print(f"  Warning: could not parse perf dump: {e}")
 
+    if iterations > 1:
+        # The perf dump covers request 1 only, so take the rest from stdout.
+        denoise_s, e2e_s = _iteration_latencies_s(captured)
+        metrics["iterations"] = iterations
+        metrics["denoise_iterations_s"] = denoise_s
+        metrics["e2e_iterations_s"] = e2e_s
+        if len(denoise_s) > 1:
+            metrics["denoise_latency_s"] = sum(denoise_s[1:]) / len(denoise_s[1:])
+        if len(e2e_s) > 1:
+            metrics["e2e_latency_s"] = sum(e2e_s[1:]) / len(e2e_s[1:])
+
     return metrics
 
 
@@ -972,7 +1031,7 @@ def print_results_table(results: list[dict]):
     print("=" * RESULTS_TABLE_WIDTH)
 
     print(
-        f"{'Model':<24} {'Nightly':<28} {'Label':<12} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
+        f"{'Model':<24} {'Nightly':<28} {'Label':<12} {'Iters':>6} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
     )
     print("-" * RESULTS_TABLE_WIDTH)
 
@@ -984,7 +1043,7 @@ def print_results_table(results: list[dict]):
         e2e_text = f"{e2e_s:.2f}" if isinstance(e2e_s, float) else "n/a"
         mem_text = f"{peak_mem:.1f}" if isinstance(peak_mem, float) else "n/a"
         print(
-            f"{result['model']:<24} {model_nightly_case_id(result['model']):<28} {result['label']:<12} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
+            f"{result['model']:<24} {model_nightly_case_id(result['model']):<28} {result['label']:<12} {result.get('iterations', 1):>6} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
         )
 
     print("-" * RESULTS_TABLE_WIDTH)
@@ -1033,6 +1092,22 @@ def main():
     )
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup")
     parser.add_argument(
+        "--model-path",
+        help=(
+            "Override the preset's Hugging Face repo, e.g. to substitute a public "
+            "mirror when the preset's own repo is gated."
+        ),
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        help=(
+            "Sequential requests per benchmark, in one process. The first is "
+            "discarded as warmup, so torch.compile cost stays out of the result."
+        ),
+    )
+    parser.add_argument(
         "--no-torch-compile",
         action="store_true",
         help="Keep torch.compile disabled for eager-mode comparisons.",
@@ -1053,21 +1128,32 @@ def main():
     torch_compile = not args.no_torch_compile
 
     models_to_run = list(MODELS.keys()) if args.all else [args.model or "flux"]
+    if args.model_path:
+        if len(models_to_run) != 1:
+            raise SystemExit("--model-path requires a single --model")
+        MODELS[models_to_run[0]]["path"] = args.model_path
     results = []
 
     for model_key in models_to_run:
         results.append(
-            run_benchmark_once(
+            run_benchmark(
                 model_key,
                 args.label,
                 output_dir,
                 warmup=warmup,
                 torch_compile=torch_compile,
+                iterations=args.iterations,
             )
         )
 
     if results:
         print_results_table(results)
+        # Machine-readable results, including the per-request arrays that the
+        # perf dumps cannot carry (those hold request 1 only).
+        summary_path = output_dir / f"results_{args.label}.json"
+        with open(summary_path, "w") as f:
+            json.dump(results, f, indent=2, sort_keys=True)
+        print(f"Results JSON → {summary_path}")
 
     print(f"Perf dump JSONs → {output_dir}")
     print(
